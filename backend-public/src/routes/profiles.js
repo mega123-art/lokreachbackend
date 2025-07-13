@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const User = require("../models/User");
+const Campaign = require("../models/Campaign");
 const SavedProfile = require("../models/SavedProfile");
 
 const { authenticate, authorizeRoles } = require("../middleware/auth");
