@@ -95,62 +95,6 @@ router.get("/brand/:brandId", authenticate, authorizeRoles("brand"), async (req,
   }
 });
 
-// PATCH /api/campaigns/:id/star/:creatorId
-router.patch("/:id/star/:creatorId", authenticate, authorizeRoles("brand"), async (req, res) => {
-  try {
-    const { id, creatorId } = req.params;
 
-    const campaign = await Campaign.findById(id);
-    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
-
-    // Ensure the brand owns this campaign
-    if (campaign.brand.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    // Check if creator exists
-    const creator = await User.findById(creatorId);
-    if (!creator || creator.role !== "creator") {
-      return res.status(404).json({ error: "Creator not found" });
-    }
-
-    if (!campaign.starredCreators.includes(creatorId)) {
-      campaign.starredCreators.push(creatorId);
-      await campaign.save();
-    }
-
-    res.status(200).json({ message: "Creator starred" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to star creator" });
-  }
-});
-
-// GET /api/campaigns/:campaignId/starred
-router.get("/:id/starred", authenticate, authorizeRoles("brand"), async (req, res) => {
-  try {
-    const campaign = await Campaign.findById(req.params.id).populate({
-      path: "starredCreators",
-      select: "username contactEmail",
-    });
-
-    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
-
-    // Ensure the brand owns this campaign
-    if (campaign.brand.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const creatorIds = campaign.starredCreators.map((c) => c._id);
-    const profiles = await CreatorProfile.find({
-      user: { $in: creatorIds },
-    }).populate("user", "username contactEmail");
-
-    res.status(200).json({ starred: profiles });
-  } catch (err) {
-    console.error("Error fetching starred creators:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
 
 module.exports = router;
