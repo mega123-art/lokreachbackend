@@ -90,7 +90,8 @@ router.get("/my", authenticate, authorizeRoles("brand"), async (req, res) => {
     // Add application count to each campaign
     const campaignsWithStats = campaigns.map(campaign => ({
       ...campaign.toObject(),
-      applicationCount: campaign.appliedCreators.length
+      applicationCount: campaign.appliedCreators.length,
+      applicants: campaign.appliedCreators // Include applicants for recruitment
     }));
 
     const totalCount = await Campaign.countDocuments(filter);
@@ -421,6 +422,129 @@ router.get("/:id/applicants", authenticate, authorizeRoles("brand"), async (req,
     });
   } catch (err) {
     console.error("Get campaign applicants error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/campaigns/:campaignId/recruit/:creatorId - Initiate recruitment chat
+router.post("/:campaignId/recruit/:creatorId", authenticate, authorizeRoles("brand"), async (req, res) => {
+  try {
+    const { campaignId, creatorId } = req.params;
+    const { initialMessage } = req.body;
+    const brandId = req.user._id;
+
+    // Verify campaign belongs to the brand
+    const campaign = await Campaign.findOne({ 
+      _id: campaignId, 
+      brand: brandId 
+    });
+
+    if (!campaign) {
+      return res.status(404).json({ 
+        error: "Campaign not found or access denied" 
+      });
+    }
+
+    // Verify creator applied to this campaign
+    const hasApplied = campaign.appliedCreators.some(
+      app => app.creator.toString() === creatorId
+    );
+
+    if (!hasApplied) {
+      return res.status(400).json({ 
+        error: "Creator has not applied to this campaign" 
+      });
+    }
+
+    // Forward to chat initiation endpoint
+    const Chat = require("../models/Chat");
+    const Message = require("../models/Message");
+    const User = require("../models/User");
+
+    // Verify creator exists and is approved
+    const creator = await User.findOne({ 
+      _id: creatorId, 
+      role: "creator", 
+      status: "approved" 
+    });
+
+    if (!creator) {
+      return res.status(404).json({ error: "Creator not found" });
+    }
+
+    // Check if chat already exists
+    let existingChat = await Chat.findOne({
+      campaign: campaignId,
+      participants: { $all: [brandId, creatorId] }
+    });
+
+    if (existingChat) {
+      return res.status(200).json({ 
+        message: "Chat already exists",
+        chatId: existingChat._id,
+        redirect: `/chats/${existingChat._id}`
+      });
+    }
+
+    // Create new chat
+    const newChat = new Chat({
+      participants: [brandId, creatorId],
+      campaign: campaignId,
+      initiatedBy: brandId,
+      lastActivity: new Date(),
+    });
+
+    await newChat.save();
+
+    // Create initial system message
+    const systemMessage = new Message({
+      chat: newChat._id,
+      sender: brandId,
+      content: `${req.user.brandName} started a conversation about "${campaign.name}"`,
+      messageType: "system",
+      systemMessageType: "chat_started",
+    });
+
+    await systemMessage.save();
+
+    // Create initial message if provided
+    if (initialMessage && initialMessage.trim()) {
+      const firstMessage = new Message({
+        chat: newChat._id,
+        sender: brandId,
+        content: initialMessage.trim(),
+        messageType: "text",
+      });
+
+      await firstMessage.save();
+      newChat.lastMessage = firstMessage._id;
+    } else {
+      newChat.lastMessage = systemMessage._id;
+    }
+
+    newChat.lastActivity = new Date();
+    await newChat.save();
+
+    // Emit socket event for real-time notification
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`user_${creatorId}`).emit('new_chat', {
+        chatId: newChat._id,
+        message: `${req.user.brandName} wants to discuss "${campaign.name}" with you!`,
+        campaign: {
+          id: campaign._id,
+          name: campaign.name
+        }
+      });
+    }
+
+    res.status(201).json({
+      message: "Recruitment chat initiated successfully",
+      chatId: newChat._id,
+      redirect: `/chats/${newChat._id}`
+    });
+  } catch (err) {
+    console.error("Recruit creator error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });

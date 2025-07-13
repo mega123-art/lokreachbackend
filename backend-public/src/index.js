@@ -4,6 +4,9 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const path = require("path");
+const http = require("http");
+const { Server } = require("socket.io");
+const { socketAuth, handleConnection } = require("./socket/socketHandler");
 
 // Load environment variables first
 dotenv.config();
@@ -26,6 +29,45 @@ console.log("✅ Environment variables loaded successfully");
 console.log("📊 Environment:", process.env.NODE_ENV || "development");
 
 const app = express();
+const server = http.createServer(app);
+
+// Initialize Socket.IO with CORS configuration
+const io = new Server(server, {
+  cors: {
+    origin: function (origin, callback) {
+      // Same CORS logic as Express
+      if (!origin) return callback(null, true);
+      
+      const allowedOrigins = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://localhost:3000",
+        "https://localhost:5173",
+        process.env.FRONTEND_URL,
+        "https://lokreach.vercel.app",
+      ].filter(Boolean);
+
+      if (origin.includes(".vercel.app") || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+    methods: ["GET", "POST"],
+  },
+  transports: ["websocket", "polling"],
+});
+
+// Socket.IO authentication middleware
+io.use(socketAuth);
+
+// Handle socket connections
+io.on("connection", handleConnection(io));
+
+// Make io available to routes
+app.set('io', io);
+
+console.log("✅ Socket.IO server initialized");
 
 // Enhanced CORS configuration for production
 const corsOptions = {
@@ -177,6 +219,15 @@ try {
   process.exit(1);
 }
 
+let chatRoutes;
+try {
+  chatRoutes = require("./routes/chat");
+  console.log("✅ Chat routes loaded");
+} catch (error) {
+  console.error("❌ Error loading chat routes:", error.message);
+  process.exit(1);
+}
+
 // API Routes with logging
 app.use(
   "/api/auth",
@@ -221,6 +272,15 @@ app.use(
     next();
   },
   adminRoutes
+);
+
+app.use(
+  "/api/chats",
+  (req, res, next) => {
+    console.log("💬 Chat route accessed:", req.method, req.path);
+    next();
+  },
+  chatRoutes
 );
 
 // Static file serving for uploads
@@ -294,6 +354,9 @@ app.use("*", (req, res) => {
       "GET /api/campaigns/all",
       "POST /api/campaigns/:id/apply",
       "GET /api/admin/creators/pending",
+      "POST /api/chats/initiate",
+      "GET /api/chats",
+      "POST /api/chats/:id/messages",
     ],
   });
 });
@@ -313,12 +376,13 @@ mongoose
     console.log("✅ Connected to MongoDB successfully");
 
     // Start server only after successful DB connection
-    const server = app.listen(PORT, "0.0.0.0", () => {
+    server.listen(PORT, "0.0.0.0", () => {
       console.log("🚀 Server started successfully!");
       console.log(`📍 Server running on port ${PORT}`);
       console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
       console.log(`🔗 Frontend URL: ${process.env.FRONTEND_URL || "Not set"}`);
       console.log(`📊 Health check: http://localhost:${PORT}/health`);
+      console.log(`💬 Socket.IO server running on same port`);
       console.log("🎯 Ready to accept requests!");
     });
 
@@ -327,6 +391,9 @@ mongoose
       console.log("📴 SIGTERM received, shutting down gracefully...");
       server.close(() => {
         console.log("✅ Server closed");
+        io.close(() => {
+          console.log("✅ Socket.IO server closed");
+        });
         mongoose.connection.close(false, () => {
           console.log("✅ MongoDB connection closed");
           process.exit(0);
@@ -338,6 +405,9 @@ mongoose
       console.log("📴 SIGINT received, shutting down gracefully...");
       server.close(() => {
         console.log("✅ Server closed");
+        io.close(() => {
+          console.log("✅ Socket.IO server closed");
+        });
         mongoose.connection.close(false, () => {
           console.log("✅ MongoDB connection closed");
           process.exit(0);
