@@ -23,8 +23,23 @@ const campaignSchema = new mongoose.Schema(
       enum: ["draft", "active", "expired", "cancelled"],
       default: "active",
     },
+    appliedCreators: [{
+      creator: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true,
+      },
+      appliedAt: {
+        type: Date,
+        default: Date.now,
+      },
+    }],
   },
   { timestamps: true }
 );
+
+// Index for querying applied creators
+campaignSchema.index({ "appliedCreators.creator": 1 });
+campaignSchema.index({ brand: 1, status: 1 });
 
 module.exports = mongoose.model("Campaign", campaignSchema);

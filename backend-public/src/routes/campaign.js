@@ -2,7 +2,6 @@
 const express = require("express");
 const router = express.Router();
 const Campaign = require("../models/Campaign");
-const Application = require("../models/Application");
 const User = require("../models/User");
 const { authenticate, authorizeRoles } = require("../middleware/auth");
 const upload = require("../middleware/upload");
@@ -47,6 +46,7 @@ router.post("/", authenticate, authorizeRoles("brand"), upload.array("images", 5
       rewardType,
       budgetRange: parsedBudgetRange,
       images: imagePaths,
+      appliedCreators: [], // Initialize empty array
     });
 
     await newCampaign.save();
@@ -87,38 +87,11 @@ router.get("/my", authenticate, authorizeRoles("brand"), async (req, res) => {
       .skip(skip)
       .limit(pageSize);
 
-    // Get application counts for each campaign
-    const campaignsWithStats = await Promise.all(
-      campaigns.map(async (campaign) => {
-        const applicationStats = await Application.aggregate([
-          { $match: { campaign: campaign._id } },
-          {
-            $group: {
-              _id: "$status",
-              count: { $sum: 1 }
-            }
-          }
-        ]);
-
-        const stats = {
-          total: 0,
-          pending: 0,
-          accepted: 0,
-          rejected: 0,
-          withdrawn: 0
-        };
-
-        applicationStats.forEach(stat => {
-          stats[stat._id] = stat.count;
-          stats.total += stat.count;
-        });
-
-        return {
-          ...campaign.toObject(),
-          applicationStats: stats
-        };
-      })
-    );
+    // Add application count to each campaign
+    const campaignsWithStats = campaigns.map(campaign => ({
+      ...campaign.toObject(),
+      applicationCount: campaign.appliedCreators.length
+    }));
 
     const totalCount = await Campaign.countDocuments(filter);
     const totalPages = Math.ceil(totalCount / pageSize);
@@ -201,20 +174,17 @@ router.get("/all", authenticate, authorizeRoles("creator"), async (req, res) => 
 
     // Check if creator has already applied to each campaign
     const creatorId = req.user._id;
-    const campaignsWithApplicationStatus = await Promise.all(
-      campaigns.map(async (campaign) => {
-        const existingApplication = await Application.findOne({
-          campaign: campaign._id,
-          creator: creatorId
-        });
+    const campaignsWithApplicationStatus = campaigns.map(campaign => {
+      const hasApplied = campaign.appliedCreators.some(
+        app => app.creator.toString() === creatorId.toString()
+      );
 
-        return {
-          ...campaign.toObject(),
-          hasApplied: !!existingApplication,
-          applicationStatus: existingApplication?.status || null
-        };
-      })
-    );
+      return {
+        ...campaign.toObject(),
+        hasApplied,
+        applicationCount: campaign.appliedCreators.length
+      };
+    });
 
     const totalCount = await Campaign.countDocuments(filter);
     const totalPages = Math.ceil(totalCount / pageSize);
@@ -250,7 +220,7 @@ router.get("/:id", authenticate, async (req, res) => {
       return res.status(404).json({ error: "Campaign not found" });
     }
 
-    // Check permissions
+    // Check permissions for brand
     if (userRole === "brand" && campaign.brand._id.toString() !== userId.toString()) {
       return res.status(403).json({ error: "Access denied" });
     }
@@ -259,42 +229,17 @@ router.get("/:id", authenticate, async (req, res) => {
 
     // Add application status for creators
     if (userRole === "creator") {
-      const existingApplication = await Application.findOne({
-        campaign: id,
-        creator: userId
-      });
+      const hasApplied = campaign.appliedCreators.some(
+        app => app.creator.toString() === userId.toString()
+      );
 
-      responseData.hasApplied = !!existingApplication;
-      responseData.applicationStatus = existingApplication?.status || null;
-      responseData.applicationId = existingApplication?._id || null;
+      responseData.hasApplied = hasApplied;
+      responseData.applicationCount = campaign.appliedCreators.length;
     }
 
-    // Add application stats for brands
+    // Add application count for brands
     if (userRole === "brand") {
-      const applicationStats = await Application.aggregate([
-        { $match: { campaign: campaign._id } },
-        {
-          $group: {
-            _id: "$status",
-            count: { $sum: 1 }
-          }
-        }
-      ]);
-
-      const stats = {
-        total: 0,
-        pending: 0,
-        accepted: 0,
-        rejected: 0,
-        withdrawn: 0
-      };
-
-      applicationStats.forEach(stat => {
-        stats[stat._id] = stat.count;
-        stats.total += stat.count;
-      });
-
-      responseData.applicationStats = stats;
+      responseData.applicationCount = campaign.appliedCreators.length;
     }
 
     res.status(200).json({ campaign: responseData });
@@ -360,21 +305,6 @@ router.delete("/:id", authenticate, authorizeRoles("brand"), async (req, res) =>
       return res.status(404).json({ error: "Campaign not found" });
     }
 
-    // Check if there are any accepted applications
-    const acceptedApplications = await Application.countDocuments({
-      campaign: id,
-      status: "accepted"
-    });
-
-    if (acceptedApplications > 0) {
-      return res.status(400).json({
-        error: "Cannot delete campaign with accepted applications"
-      });
-    }
-
-    // Delete all applications for this campaign
-    await Application.deleteMany({ campaign: id });
-
     // Delete the campaign
     await Campaign.findByIdAndDelete(id);
 
@@ -390,7 +320,6 @@ router.post("/:id/apply", authenticate, authorizeRoles("creator"), async (req, r
   try {
     const { id } = req.params;
     const creatorId = req.user._id;
-    const { message, proposedDeliverables, proposedTimeline } = req.body;
 
     // Check if campaign exists and is active
     const campaign = await Campaign.findById(id);
@@ -408,38 +337,27 @@ router.post("/:id/apply", authenticate, authorizeRoles("creator"), async (req, r
     }
 
     // Check if creator has already applied
-    const existingApplication = await Application.findOne({
-      campaign: id,
-      creator: creatorId
-    });
+    const hasApplied = campaign.appliedCreators.some(
+      app => app.creator.toString() === creatorId.toString()
+    );
 
-    if (existingApplication) {
+    if (hasApplied) {
       return res.status(400).json({ 
-        error: "You have already applied to this campaign",
-        applicationStatus: existingApplication.status
+        error: "You have already applied to this campaign"
       });
     }
 
-    // Create new application
-    const newApplication = new Application({
-      campaign: id,
+    // Add creator to applied list
+    campaign.appliedCreators.push({
       creator: creatorId,
-      message: message || "",
-      proposedDeliverables: proposedDeliverables || "",
-      proposedTimeline: proposedTimeline || ""
+      appliedAt: new Date()
     });
 
-    await newApplication.save();
+    await campaign.save();
 
-    // Populate the application with campaign and creator details
-    await newApplication.populate([
-      { path: "campaign", select: "name brand" },
-      { path: "creator", select: "instaUsername email city niche" }
-    ]);
-
-    res.status(201).json({
-      message: "Application submitted successfully",
-      application: newApplication
+    res.status(200).json({
+      message: "Applied to campaign successfully",
+      applicationCount: campaign.appliedCreators.length
     });
   } catch (err) {
     console.error("Apply to campaign error:", err);
@@ -447,12 +365,12 @@ router.post("/:id/apply", authenticate, authorizeRoles("creator"), async (req, r
   }
 });
 
-// GET /api/campaigns/:id/applications - Get applications for a campaign (for brands)
-router.get("/:id/applications", authenticate, authorizeRoles("brand"), async (req, res) => {
+// GET /api/campaigns/:id/applicants - Get applicants for a campaign (for brands)
+router.get("/:id/applicants", authenticate, authorizeRoles("brand"), async (req, res) => {
   try {
     const { id } = req.params;
     const brandId = req.user._id;
-    const { status, page = 1, limit = 10 } = req.query;
+    const { page = 1, limit = 10 } = req.query;
 
     // Verify campaign belongs to the brand
     const campaign = await Campaign.findOne({ _id: id, brand: brandId });
@@ -460,135 +378,127 @@ router.get("/:id/applications", authenticate, authorizeRoles("brand"), async (re
       return res.status(404).json({ error: "Campaign not found" });
     }
 
-    // Build filter
-    const filter = { campaign: id };
-    if (status && ["pending", "accepted", "rejected", "withdrawn"].includes(status)) {
-      filter.status = status;
-    }
-
     // Calculate pagination
     const pageNumber = Math.max(1, parseInt(page));
     const pageSize = Math.min(50, Math.max(1, parseInt(limit)));
     const skip = (pageNumber - 1) * pageSize;
 
-    const applications = await Application.find(filter)
-      .populate("creator", "instaUsername email city niche scrapedData")
-      .populate("campaign", "name")
-      .sort({ appliedAt: -1 })
-      .skip(skip)
-      .limit(pageSize);
+    // Get campaign with populated applicants
+    const campaignWithApplicants = await Campaign.findById(id)
+      .populate({
+        path: "appliedCreators.creator",
+        select: "instaUsername email city niche scrapedData state contactNumber"
+      })
+      .lean();
 
-    const totalCount = await Application.countDocuments(filter);
-    const totalPages = Math.ceil(totalCount / pageSize);
+    if (!campaignWithApplicants) {
+      return res.status(404).json({ error: "Campaign not found" });
+    }
+
+    // Apply pagination to applicants
+    const totalApplicants = campaignWithApplicants.appliedCreators.length;
+    const paginatedApplicants = campaignWithApplicants.appliedCreators
+      .sort((a, b) => new Date(b.appliedAt) - new Date(a.appliedAt))
+      .slice(skip, skip + pageSize);
+
+    const totalPages = Math.ceil(totalApplicants / pageSize);
 
     res.status(200).json({
-      applications,
+      campaign: {
+        id: campaignWithApplicants._id,
+        name: campaignWithApplicants.name,
+        description: campaignWithApplicants.description
+      },
+      applicants: paginatedApplicants,
       pagination: {
         currentPage: pageNumber,
         totalPages,
-        totalItems: totalCount,
+        totalItems: totalApplicants,
         itemsPerPage: pageSize,
         hasNextPage: pageNumber < totalPages,
         hasPreviousPage: pageNumber > 1
       }
     });
   } catch (err) {
-    console.error("Get campaign applications error:", err);
+    console.error("Get campaign applicants error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// PATCH /api/campaigns/:campaignId/applications/:applicationId - Update application status (for brands)
-router.patch("/:campaignId/applications/:applicationId", authenticate, authorizeRoles("brand"), async (req, res) => {
+// DELETE /api/campaigns/:id/unapply - Remove application (for creators)
+router.delete("/:id/unapply", authenticate, authorizeRoles("creator"), async (req, res) => {
   try {
-    const { campaignId, applicationId } = req.params;
-    const brandId = req.user._id;
-    const { status, message } = req.body;
+    const { id } = req.params;
+    const creatorId = req.user._id;
 
-    if (!["accepted", "rejected"].includes(status)) {
-      return res.status(400).json({ error: "Invalid status" });
-    }
-
-    // Verify campaign belongs to the brand
-    const campaign = await Campaign.findOne({ _id: campaignId, brand: brandId });
+    const campaign = await Campaign.findById(id);
     if (!campaign) {
       return res.status(404).json({ error: "Campaign not found" });
     }
 
-    // Find and update the application
-    const application = await Application.findOne({
-      _id: applicationId,
-      campaign: campaignId
-    });
+    // Check if creator has applied
+    const applicationIndex = campaign.appliedCreators.findIndex(
+      app => app.creator.toString() === creatorId.toString()
+    );
 
-    if (!application) {
-      return res.status(404).json({ error: "Application not found" });
+    if (applicationIndex === -1) {
+      return res.status(400).json({ error: "You have not applied to this campaign" });
     }
 
-    if (application.status !== "pending") {
-      return res.status(400).json({ error: "Application has already been processed" });
-    }
+    // Remove the application
+    campaign.appliedCreators.splice(applicationIndex, 1);
+    await campaign.save();
 
-    application.status = status;
-    application.brandResponse = {
-      message: message || "",
-      respondedAt: new Date(),
-      respondedBy: brandId
-    };
-
-    await application.save();
-
-    // Populate for response
-    await application.populate([
-      { path: "creator", select: "instaUsername email" },
-      { path: "campaign", select: "name" }
-    ]);
-
-    res.status(200).json({
-      message: `Application ${status} successfully`,
-      application
+    res.status(200).json({ 
+      message: "Application removed successfully",
+      applicationCount: campaign.appliedCreators.length
     });
   } catch (err) {
-    console.error("Update application status error:", err);
+    console.error("Remove application error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// GET /api/campaigns/applications/my - Get creator's applications
-router.get("/applications/my", authenticate, authorizeRoles("creator"), async (req, res) => {
+// GET /api/campaigns/my/applications - Get campaigns creator has applied to
+router.get("/my/applications", authenticate, authorizeRoles("creator"), async (req, res) => {
   try {
     const creatorId = req.user._id;
-    const { status, page = 1, limit = 10 } = req.query;
-
-    // Build filter
-    const filter = { creator: creatorId };
-    if (status && ["pending", "accepted", "rejected", "withdrawn"].includes(status)) {
-      filter.status = status;
-    }
+    const { page = 1, limit = 10 } = req.query;
 
     // Calculate pagination
     const pageNumber = Math.max(1, parseInt(page));
     const pageSize = Math.min(50, Math.max(1, parseInt(limit)));
     const skip = (pageNumber - 1) * pageSize;
 
-    const applications = await Application.find(filter)
-      .populate({
-        path: "campaign",
-        select: "name description rewardType budgetRange startDate endDate status",
-        populate: {
-          path: "brand",
-          select: "brandName email"
-        }
-      })
-      .sort({ appliedAt: -1 })
-      .skip(skip)
-      .limit(pageSize);
+    // Find campaigns where creator has applied
+    const campaigns = await Campaign.find({
+      "appliedCreators.creator": creatorId
+    })
+    .populate("brand", "brandName email")
+    .sort({ "appliedCreators.appliedAt": -1 })
+    .skip(skip)
+    .limit(pageSize);
 
-    const totalCount = await Application.countDocuments(filter);
+    // Add application date to each campaign
+    const campaignsWithApplicationDate = campaigns.map(campaign => {
+      const application = campaign.appliedCreators.find(
+        app => app.creator.toString() === creatorId.toString()
+      );
+      
+      return {
+        ...campaign.toObject(),
+        appliedAt: application.appliedAt,
+        applicationCount: campaign.appliedCreators.length
+      };
+    });
+
+    const totalCount = await Campaign.countDocuments({
+      "appliedCreators.creator": creatorId
+    });
     const totalPages = Math.ceil(totalCount / pageSize);
 
     res.status(200).json({
-      applications,
+      campaigns: campaignsWithApplicationDate,
       pagination: {
         currentPage: pageNumber,
         totalPages,
@@ -600,35 +510,6 @@ router.get("/applications/my", authenticate, authorizeRoles("creator"), async (r
     });
   } catch (err) {
     console.error("Get creator applications error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// DELETE /api/campaigns/applications/:applicationId - Withdraw application (for creators)
-router.delete("/applications/:applicationId", authenticate, authorizeRoles("creator"), async (req, res) => {
-  try {
-    const { applicationId } = req.params;
-    const creatorId = req.user._id;
-
-    const application = await Application.findOne({
-      _id: applicationId,
-      creator: creatorId
-    });
-
-    if (!application) {
-      return res.status(404).json({ error: "Application not found" });
-    }
-
-    if (application.status === "accepted") {
-      return res.status(400).json({ error: "Cannot withdraw accepted application" });
-    }
-
-    application.status = "withdrawn";
-    await application.save();
-
-    res.status(200).json({ message: "Application withdrawn successfully" });
-  } catch (err) {
-    console.error("Withdraw application error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
