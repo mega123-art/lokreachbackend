@@ -125,9 +125,10 @@ app.get("/", (req, res) => {
     endpoints: {
       health: "/health",
       auth: "/api/auth",
-      creators: "/api/creators",
+      profiles: "/api/profiles",
       campaigns: "/api/campaigns",
       admin: "/api/admin",
+      creators: "/api/creators",
     },
   });
 });
@@ -167,6 +168,15 @@ try {
   process.exit(1);
 }
 
+let profileRoutes;
+try {
+  profileRoutes = require("./routes/profiles");
+  console.log("✅ Profile routes loaded");
+} catch (error) {
+  console.error("❌ Error loading profile routes:", error.message);
+  process.exit(1);
+}
+
 // API Routes with logging
 app.use(
   "/api/auth",
@@ -193,6 +203,15 @@ app.use(
     next();
   },
   campaignRoutes
+);
+
+app.use(
+  "/api/profiles",
+  (req, res, next) => {
+    console.log("👤 Profile route accessed:", req.method, req.path);
+    next();
+  },
+  profileRoutes
 );
 
 app.use(
@@ -270,8 +289,11 @@ app.use("*", (req, res) => {
       "GET /",
       "POST /api/auth/signup",
       "POST /api/auth/signin",
-      "GET /api/creators",
+      "GET /api/profiles/creators",
       "POST /api/campaigns",
+      "GET /api/campaigns/all",
+      "POST /api/campaigns/:id/apply",
+      "GET /api/admin/creators/pending",
     ],
   });
 });
