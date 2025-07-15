@@ -18,6 +18,105 @@ const apifyClient = new ApifyClient({
   token: `${process.env.APIFY_API_TOKEN}`,
 });
 
+// Function to scrape Instagram post comments
+async function scrapeInstagramComments(postUrl) {
+  try {
+    console.log(`🔍 Starting Instagram comment scrape for post: ${postUrl}`);
+
+    const input = {
+      directUrls: [postUrl],
+      resultsLimit: 100, // Increase limit to get more comments
+    };
+
+    const run = await apifyClient.actor("SbK00X0JYCPblD2wp").call(input);
+    const { items } = await apifyClient
+      .dataset(run.defaultDatasetId)
+      .listItems();
+
+    if (items.length === 0) {
+      console.log("❌ No data found for the Instagram post");
+      return { success: false, comments: [], error: "Post not found or no comments" };
+    }
+
+    const postData = items[0];
+    const comments = postData.comments || [];
+
+    console.log(`✅ Successfully scraped ${comments.length} comments`);
+    return { success: true, comments, postData };
+  } catch (error) {
+    console.error("❌ Error during Instagram comment scrape:", error.message);
+    return { success: false, comments: [], error: error.message };
+  }
+}
+
+// Function to verify if user commented with product name
+async function verifyUserComment(instaUsername, postUrl, requiredProductName) {
+  try {
+    console.log(`🔍 Verifying comment by @${instaUsername} for product: ${requiredProductName}`);
+
+    const scrapeResult = await scrapeInstagramComments(postUrl);
+    
+    if (!scrapeResult.success) {
+      return {
+        verified: false,
+        error: scrapeResult.error,
+        message: "Failed to scrape comments from the post"
+      };
+    }
+
+    const { comments } = scrapeResult;
+    
+    // Clean the username (remove @ if present)
+    const cleanUsername = instaUsername.replace(/^@/, "").toLowerCase().trim();
+    const productNameLower = requiredProductName.toLowerCase().trim();
+
+    // Find comments by the user
+    const userComments = comments.filter(comment => {
+      const commentUsername = comment.ownerUsername?.toLowerCase().trim();
+      return commentUsername === cleanUsername;
+    });
+
+    if (userComments.length === 0) {
+      return {
+        verified: false,
+        message: `No comments found by @${instaUsername} on this post`,
+        totalComments: comments.length
+      };
+    }
+
+    // Check if any of the user's comments contain the product name
+    const verifiedComment = userComments.find(comment => {
+      const commentText = comment.text?.toLowerCase().trim() || "";
+      return commentText.includes(productNameLower);
+    });
+
+    if (verifiedComment) {
+      console.log(`✅ Verification successful! Found comment: "${verifiedComment.text}"`);
+      return {
+        verified: true,
+        message: "Comment verification successful",
+        comment: verifiedComment.text,
+        commentedAt: verifiedComment.timestamp,
+        userComments: userComments.length,
+        totalComments: comments.length
+      };
+    } else {
+      return {
+        verified: false,
+        message: `@${instaUsername} commented on the post but didn't mention "${requiredProductName}"`,
+        userComments: userComments.map(c => c.text),
+        totalComments: comments.length
+      };
+    }
+  } catch (error) {
+    console.error("❌ Error during comment verification:", error.message);
+    return {
+      verified: false,
+      error: error.message,
+      message: "Error occurred during comment verification"
+    };
+  }
+}
 async function scrapeInstagramData(instaUsername) {
   try {
     console.log(`🔍 Starting Instagram scrape for: ${instaUsername}`);
@@ -125,6 +224,9 @@ router.post("/signup", async (req, res) => {
       state,
       city,
       instaUsername,
+      // Comment verification fields (for creators)
+      verificationPostUrl,
+      productName,
     } = req.body;
 
     // === Basic validation ===
@@ -170,6 +272,23 @@ router.post("/signup", async (req, res) => {
         });
       }
 
+      // Comment verification validation for creators
+      if (!verificationPostUrl || !productName) {
+        return res.status(400).json({
+          error: "Comment verification is required for creators",
+          required: ["verificationPostUrl", "productName"],
+          message: "Please provide the Instagram post URL and product name for verification"
+        });
+      }
+
+      // Validate Instagram post URL format
+      const instagramPostRegex = /^https:\/\/(www\.)?instagram\.com\/(p|reel)\/[A-Za-z0-9_-]+/;
+      if (!instagramPostRegex.test(verificationPostUrl)) {
+        return res.status(400).json({
+          error: "Invalid Instagram post URL format",
+          message: "Please provide a valid Instagram post or reel URL"
+        });
+      }
       // Instagram username validation
       const normalizedInstaUsername = instaUsername.toLowerCase().trim();
       if (!/^[a-zA-Z0-9_.]+$/.test(normalizedInstaUsername)) {
@@ -229,6 +348,33 @@ router.post("/signup", async (req, res) => {
       }
     }
 
+    // === Comment verification for creators ===
+    let commentVerificationResult = null;
+    if (role === "creator" && normalizedInstaUsername && verificationPostUrl && productName) {
+      console.log("🔍 Starting comment verification process...");
+      
+      commentVerificationResult = await verifyUserComment(
+        normalizedInstaUsername,
+        verificationPostUrl,
+        productName.trim()
+      );
+
+      if (!commentVerificationResult.verified) {
+        return res.status(400).json({
+          error: "Comment verification failed",
+          field: "commentVerification",
+          details: commentVerificationResult.message,
+          verificationData: {
+            userComments: commentVerificationResult.userComments || [],
+            totalComments: commentVerificationResult.totalComments || 0,
+            requiredProductName: productName.trim()
+          },
+          instructions: `Please comment "${productName.trim()}" on the Instagram post and try again`
+        });
+      }
+
+      console.log("✅ Comment verification successful!");
+    }
     // === Hash password ===
     const hashedPassword = await bcrypt.hash(password, 12);
 
@@ -277,6 +423,17 @@ router.post("/signup", async (req, res) => {
         instaUsername: normalizedInstaUsername,
         niche: niche?.trim(),
         ...(scrapedData && { scrapedData }),
+        // Store comment verification data
+        ...(commentVerificationResult && {
+          commentVerification: {
+            verified: true,
+            postUrl: verificationPostUrl,
+            productName: productName.trim(),
+            comment: commentVerificationResult.comment,
+            verifiedAt: new Date(),
+            commentedAt: commentVerificationResult.commentedAt
+          }
+        }),
       }),
     });
 
@@ -311,12 +468,22 @@ router.post("/signup", async (req, res) => {
     if (role === "creator") {
       responseData.instagramDataScraped = !!scrapedData;
       responseData.instagramUsernameValidated = true;
+      responseData.commentVerified = !!commentVerificationResult?.verified;
+      
       if (scrapedData) {
         responseData.instagramStats = {
           followers: scrapedData.followers,
           engagementRate: scrapedData.engagementRate,
           avgLikes: scrapedData.avgLikes,
           totalUploads: scrapedData.totalUploads,
+        };
+      }
+
+      if (commentVerificationResult?.verified) {
+        responseData.verificationDetails = {
+          comment: commentVerificationResult.comment,
+          verifiedAt: new Date(),
+          postUrl: verificationPostUrl
         };
       }
     }
@@ -330,6 +497,9 @@ router.post("/signup", async (req, res) => {
     }
     if (scrapedData) {
       console.log("📊 Instagram data included in user profile");
+    }
+    if (commentVerificationResult?.verified) {
+      console.log("✅ Comment verification completed successfully");
     }
     console.log("=== SIGNUP REQUEST END ===");
   } catch (err) {

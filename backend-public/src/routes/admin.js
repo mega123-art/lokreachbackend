@@ -92,7 +92,15 @@ router.get(
         return res.status(404).json({ error: "Creator not found" });
       }
 
-      res.status(200).json({ creator });
+      // Include comment verification status in response
+      const responseData = {
+        creator: {
+          ...creator.toObject(),
+          commentVerificationStatus: creator.commentVerification?.verified || false,
+          verificationDetails: creator.commentVerification || null
+        }
+      };
+      res.status(200).json(responseData);
     } catch (err) {
       console.error("Error fetching creator details:", err);
       res.status(500).json({ error: "Server error" });

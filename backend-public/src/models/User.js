@@ -104,6 +104,18 @@ const userSchema = new mongoose.Schema(
       default: "",
     },
 
+    // Comment verification data for creators
+    commentVerification: {
+      verified: {
+        type: Boolean,
+        default: false,
+      },
+      postUrl: String,
+      productName: String,
+      comment: String,
+      verifiedAt: Date,
+      commentedAt: Date,
+    },
     resetToken: String,
     resetTokenExpiry: Date,
   },
